@@ -29,3 +29,5 @@ Thumbs.db
 # GenLayer build artifacts
 artifacts/
 scratch/
+.vercel
+.env*
