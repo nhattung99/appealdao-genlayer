@@ -1,0 +1,4 @@
+genlayer-py>=0.16.3
+genlayer-test>=0.29.2
+pytest>=9.0.0
+python-dotenv>=1.0.0
