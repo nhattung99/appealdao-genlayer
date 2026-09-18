@@ -13,7 +13,15 @@ This dApp targets **hosted GenLayer Studionet only**. It is not deployed to Asim
 
 ## Live App
 
-_Pending Vercel production deploy._
+**URL:** [https://appealdao-genlayer.vercel.app](https://appealdao-genlayer.vercel.app)
+
+This dApp is deployed against **hosted GenLayer Studionet**. It is **not** deployed to Asimov/Bradbury testnet.
+
+**How to try:**
+1. Install MetaMask. Open the live URL and click **Connect MetaMask**. The app adds/switches to Studionet.
+2. Fund the connected address with GEN from [GenLayer Studio](https://studio.genlayer.com) → **Accounts** (not the public testnet faucet).
+3. Contribute to the community pool, then file an appeal with evidence URLs and at least two independent policy references.
+4. Click **Request AI adjudication** and wait for the on-chain binary verdict.
 
 ---
 
