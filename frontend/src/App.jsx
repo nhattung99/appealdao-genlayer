@@ -24,6 +24,7 @@ import {
   switchToGenlayerStudionet,
   sendContractTransaction,
   waitForFinalizedTx,
+  waitForContractEffect,
   readContractState,
   parseGenToWei,
   formatWeiToGen,
@@ -34,6 +35,7 @@ import {
   sameAddress,
   txExplorerUrl,
   addressExplorerUrl,
+  formatWriteError,
 } from './genlayerClient.js';
 import { minBigInt as minWei } from './money.js';
 import { PLATFORMS, SAMPLE_FLAGGED_URLS, FUND_PRESETS } from './data/platforms.js';
@@ -139,7 +141,7 @@ export default function App() {
       setConfig(emptyConfig);
       return;
     }
-    const res = await readContractState('get_config', [], contractAddress);
+    const res = await readContractState('get_config', [], contractAddress, account);
     if (res && typeof res === 'object') {
       setConfig({
         owner: String(res.owner || ''),
@@ -150,7 +152,7 @@ export default function App() {
         configured: Boolean(res.configured),
       });
     }
-  }, [hasContract, contractAddress]);
+  }, [hasContract, contractAddress, account]);
 
   const loadAppeals = useCallback(async () => {
     if (!hasContract) {
@@ -159,23 +161,25 @@ export default function App() {
     }
     let rows = [];
     try {
-      const listed = await readContractState('list_appeals', [], contractAddress);
+      const listed = await readContractState('list_appeals', [], contractAddress, account);
       if (Array.isArray(listed)) rows = listed;
     } catch (err) {
       console.warn('list_appeals note:', err);
     }
     if (!rows.length) {
-      const countRaw = await readContractState('get_appeal_count', [], contractAddress);
+      const countRaw = await readContractState('get_appeal_count', [], contractAddress, account);
       const count = Number(countRaw || 0);
       const filled = [];
       for (let i = 0; i < count; i += 1) {
-        const row = await readContractState('get_appeal', [String(i)], contractAddress);
-        if (row && row.id) filled.push(row);
+        const row = await readContractState('get_appeal', [String(i)], contractAddress, account);
+        if (row && (row.id !== undefined || row.status)) {
+          filled.push({ id: String(i), ...row });
+        }
       }
       rows = filled;
     }
     setAppeals(rows);
-  }, [hasContract, contractAddress]);
+  }, [hasContract, contractAddress, account]);
 
   const refreshAll = useCallback(async () => {
     await loadConfig();
@@ -198,7 +202,31 @@ export default function App() {
     return null;
   };
 
-  const runWrite = async (title, functionName, args, value = 0n, { ai = false, appealId = null } = {}) => {
+  const snapshotConfig = async () => {
+    const res = await readContractState('get_config', [], contractAddress, account);
+    if (!res || typeof res !== 'object') {
+      return {
+        pool: 0n,
+        counter: 0n,
+        deposit: 0n,
+        bonus: 0n,
+      };
+    }
+    return {
+      pool: weiFromField(res.pool_balance),
+      counter: BigInt(String(res.appeal_counter || '0').replace(/[^0-9]/g, '') || '0'),
+      deposit: weiFromField(res.appeal_deposit_amount),
+      bonus: weiFromField(res.overturned_bonus_amount),
+    };
+  };
+
+  const runWrite = async (
+    title,
+    functionName,
+    args,
+    value = 0n,
+    { ai = false, appealId = null, confirm = null } = {}
+  ) => {
     if (!hasContract) throw new Error('Contract address is not configured yet.');
     if (!account) throw new Error('Connect MetaMask first.');
     setBusy(true);
@@ -208,9 +236,10 @@ export default function App() {
       title: ai ? 'Waiting for GenLayer AI consensus…' : `Submitting ${title}`,
       detail: ai
         ? 'Validators compare the binary verdict (OVERTURNED vs UPHELD). This can take a minute.'
-        : 'Please sign in MetaMask on GenLayer Studionet.',
+        : 'Confirm in MetaMask on GenLayer Studionet. Keep this tab open until confirmation finishes.',
     });
     try {
+      const before = confirm ? await snapshotConfig() : null;
       const hash = await sendContractTransaction({
         from: account,
         to: contractAddress,
@@ -218,10 +247,49 @@ export default function App() {
         args,
         value,
       });
-      await waitForFinalizedTx(hash, ai ? 90 : 24, ai ? 4000 : 2000);
+
+      setTxMessage({
+        status: 'pending',
+        title: `${title} submitted`,
+        detail: 'Waiting for Studionet inclusion + GenVM execution…',
+        hash,
+      });
+
+      const receipt = await waitForFinalizedTx(hash, ai ? 90 : 40, ai ? 4000 : 2500);
+      if (receipt?.pending) {
+        setTxMessage({
+          status: 'pending',
+          title: `${title}: confirming on-chain state…`,
+          detail: receipt.warning || 'EVM receipt slow — verifying contract storage instead.',
+          hash,
+        });
+      }
+
+      if (confirm) {
+        setTxMessage({
+          status: 'pending',
+          title: `${title}: waiting for contract storage…`,
+          detail: 'Studionet GenVM can lag a few seconds behind the MetaMask confirmation.',
+          hash,
+        });
+        await waitForContractEffect({
+          label: title,
+          retries: ai ? 60 : 36,
+          intervalMs: ai ? 4000 : 2500,
+          read: async () => {
+            const after = await snapshotConfig();
+            return { before, after };
+          },
+          predicate: async ({ before: b, after }) => {
+            const ok = await confirm(b, after);
+            return Boolean(ok);
+          },
+        });
+      }
+
       setTxMessage({
         status: 'success',
-        title: `${title} confirmed`,
+        title: `${title} confirmed on Studionet`,
         detail: hash,
         hash,
       });
@@ -229,11 +297,14 @@ export default function App() {
       if (appealId) await loadDetail(appealId);
       return hash;
     } catch (err) {
+      const detail = formatWriteError(err) || err.message || String(err);
       setTxMessage({
         status: 'error',
         title: `${title} failed`,
-        detail: err.message || String(err),
+        detail,
       });
+      // Re-sync UI so a late-landing tx still shows up.
+      try { await refreshAll(); } catch { /* ignore */ }
       throw err;
     } finally {
       setBusy(false);
@@ -247,12 +318,18 @@ export default function App() {
       setTxMessage({ status: 'error', title: 'Invalid amount', detail: 'Enter a GEN amount greater than 0.' });
       return;
     }
-    await runWrite('Fund community pool', 'fund_pool', [], wei);
+    await runWrite('Fund community pool', 'fund_pool', [], wei, {
+      confirm: (before, after) => after.pool >= before.pool + wei,
+    });
   };
 
   const handleFileAppeal = async () => {
     if (!contractReady) {
       setTxMessage({ status: 'error', title: 'Deposit not configured', detail: 'Owner must call set_config before appeals can be filed.' });
+      return;
+    }
+    if (depositWei <= 0n) {
+      setTxMessage({ status: 'error', title: 'Deposit missing', detail: 'Refresh the page. Appeal deposit must be > 0 on-chain.' });
       return;
     }
     const flagged = flaggedUrls.map((u) => u.trim()).filter(Boolean);
@@ -269,30 +346,64 @@ export default function App() {
       setTxMessage({ status: 'error', title: 'Policy sources required', detail: 'Need at least 2 independent policy reference URLs.' });
       return;
     }
-    await runWrite(
-      'File appeal',
-      'file_appeal',
-      [selectedPlatform.name, description.trim(), flagged, policies],
-      depositWei
-    );
-    setDescription('');
-    setFlaggedUrls(['']);
-    setTab('appeals');
+    try {
+      await runWrite(
+        'File appeal',
+        'file_appeal',
+        [selectedPlatform.name, description.trim(), flagged, policies],
+        depositWei,
+        {
+          confirm: (before, after) => after.counter > before.counter,
+        }
+      );
+      setDescription('');
+      setFlaggedUrls(['']);
+      setTab('appeals');
+    } catch {
+      // Error banner already set inside runWrite.
+    }
   };
 
   const handleResolve = async (appealId) => {
-    await runWrite('AI adjudication', 'resolve_appeal', [String(appealId)], 0n, { ai: true, appealId });
+    const beforeRow = details[String(appealId)] || appeals.find((a) => String(a.id) === String(appealId)) || {};
+    const beforeStatus = String(beforeRow.status || 'SUBMITTED');
+    await runWrite('AI adjudication', 'resolve_appeal', [String(appealId)], 0n, {
+      ai: true,
+      appealId,
+      confirm: async () => {
+        const row = await readContractState('get_appeal', [String(appealId)], contractAddress, account);
+        if (!row || typeof row !== 'object') return false;
+        const status = String(row.status || '');
+        return status !== beforeStatus && status !== '';
+      },
+    });
   };
 
   const handleRetry = async (appealId) => {
-    await runWrite('Retry payout', 'retry_resolution', [String(appealId)], 0n, { appealId });
+    await runWrite('Retry payout', 'retry_resolution', [String(appealId)], 0n, {
+      appealId,
+      confirm: async () => {
+        const row = await readContractState('get_appeal', [String(appealId)], contractAddress, account);
+        return Boolean(row && String(row.status) === 'RESOLVED_OVERTURNED');
+      },
+    });
   };
 
   const handleAddEvidence = async () => {
     const flagged = extraFlagged.map((u) => u.trim()).filter(Boolean);
     const policies = extraPolicy.map((u) => u.trim()).filter(Boolean);
     if (!evidenceAppealId) return;
-    await runWrite('Add evidence', 'add_evidence', [String(evidenceAppealId), flagged, policies], 0n, { appealId: evidenceAppealId });
+    if (flagged.length < 1 && policies.length < 1) {
+      setTxMessage({ status: 'error', title: 'Evidence required', detail: 'Add at least one URL.' });
+      return;
+    }
+    await runWrite('Add evidence', 'add_evidence', [String(evidenceAppealId), flagged, policies], 0n, {
+      appealId: evidenceAppealId,
+      confirm: async () => {
+        const row = await readContractState('get_appeal', [String(evidenceAppealId)], contractAddress, account);
+        return Boolean(row && String(row.status) === 'SUBMITTED');
+      },
+    });
     setExtraFlagged(['']);
     setExtraPolicy(['']);
   };
@@ -304,7 +415,9 @@ export default function App() {
       setTxMessage({ status: 'error', title: 'Invalid config', detail: 'Both deposit and bonus must be greater than 0 GEN.' });
       return;
     }
-    await runWrite('Set config', 'set_config', [deposit, bonus], 0n);
+    await runWrite('Set config', 'set_config', [deposit, bonus], 0n, {
+      confirm: (_before, after) => after.deposit === deposit && after.bonus === bonus,
+    });
   };
 
   const applyPlatform = (id) => {
@@ -445,7 +558,7 @@ export default function App() {
               onChange={(e) => setFundGen(sanitizeGenInput(e.target.value))}
               placeholder="10"
             />
-            <p className="hint">Sends {formatWeiToGen(parseGenToWei(fundGen))} GEN ({parseGenToWei(fundGen).toString()} wei).</p>
+            <p className="hint">Sends {formatWeiToGen(parseGenToWei(fundGen))} GEN ({parseGenToWei(fundGen).toString()} wei). Wallet needs this amount plus gas from Studio → Accounts.</p>
             <button className="btn-primary full" type="button" disabled={busy || !hasContract || !account} onClick={handleFund}>
               <Coins size={16} /> Fund pool
             </button>

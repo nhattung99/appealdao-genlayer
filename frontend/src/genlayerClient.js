@@ -1,7 +1,6 @@
 import { createClient } from 'genlayer-js';
 import { studionet as officialStudionet } from 'genlayer-js/chains';
-import { ExecutionResult, TransactionStatus } from 'genlayer-js/types';
-import { toHex, toRlp } from 'viem';
+import { TransactionStatus } from 'genlayer-js/types';
 import {
   parseGenToWei,
   formatWeiToGen,
@@ -23,10 +22,12 @@ export {
 };
 
 const ZERO = '0x0000000000000000000000000000000000000000';
+const VIEW_FROM = '0x0000000000000000000000000000000000000001';
+const STUDIO_RPC = 'https://studio.genlayer.com/api';
 const rawAddress = (import.meta.env.VITE_CONTRACT_ADDRESS || '').trim();
 
 export const DEFAULT_CONTRACT_ADDRESS = rawAddress;
-export const EXPLORER_BASE = 'https://genlayer-explorer.vercel.app';
+export const EXPLORER_BASE = 'https://explorer-studio.genlayer.com';
 
 export const isValidContractAddress = (addr) => {
   const s = String(addr || '').trim();
@@ -38,20 +39,42 @@ export const hasContractAddress = isValidContractAddress(rawAddress);
 export const studionet = officialStudionet || {
   id: 61999,
   name: 'GenLayer Studionet',
-  rpcUrl: 'https://studio.genlayer.com/api',
+  rpcUrls: { default: { http: [STUDIO_RPC] } },
   nativeCurrency: {
-    name: 'GenLayer Token',
+    name: 'GEN Token',
     symbol: 'GEN',
     decimals: 18,
   },
 };
 
-const toAddress = (account) => {
-  if (!account) return '';
-  if (typeof account === 'string') return account;
-  return account.address || '';
+/** Same-origin proxy in browser (Vite + Vercel). Direct Studio RPC in Node. */
+export const studioRpcUrl = (origin) => {
+  if (!origin || typeof origin !== 'string') return STUDIO_RPC;
+  return `${origin.replace(/\/$/, '')}/api/genlayer`;
 };
 
+const browserOrigin = () => (typeof window !== 'undefined' ? window.location.origin : '');
+
+function studioChain() {
+  const endpoint = studioRpcUrl(browserOrigin());
+  return {
+    ...studionet,
+    rpcUrls: {
+      default: { http: [endpoint] },
+    },
+  };
+}
+
+const toAddress = (account) => {
+  if (!account) return '';
+  if (typeof account === 'string') return account.trim();
+  return String(account.address || '').trim();
+};
+
+/**
+ * MetaMask routing in genlayer-js only fires when client.account is a hex string
+ * (typeof !== "object"). Encoding needs { address } or _sender is undefined.
+ */
 const toWriteAccount = (account) => {
   const address = toAddress(account);
   if (!address) return null;
@@ -65,40 +88,43 @@ export const sameAddress = (a, b) => {
   return left === right;
 };
 
-export const getGenlayerClient = (account) => {
-  try {
-    const cfg = {
-      chain: officialStudionet || studionet,
-    };
-    const address = toAddress(account);
-    if (address) cfg.account = address;
-    if (typeof window !== 'undefined' && window.ethereum) {
-      cfg.provider = window.ethereum;
-    }
-    return createClient(cfg);
-  } catch (err) {
-    console.warn('GenLayer client initialization fallback:', err);
-    return null;
-  }
-};
-
-const asPlain = (val) => {
+export const asPlain = (val) => {
   if (val instanceof Map) {
     const obj = {};
     for (const [k, v] of val.entries()) obj[String(k)] = asPlain(v);
     return obj;
   }
   if (Array.isArray(val)) return val.map(asPlain);
+  if (typeof val === 'bigint') return val.toString();
   return val;
 };
 
 export const unwrapViewResult = (val) => {
   const plain = asPlain(val);
+  if (plain === null || plain === undefined) return plain;
   if (typeof plain === 'string') {
     const trimmed = plain.trim();
-    if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+    if (/^0x[0-9a-fA-F]+$/.test(trimmed) && trimmed.length > 4 && trimmed.length % 2 === 0) {
       try {
-        return JSON.parse(trimmed);
+        const hex = trimmed.slice(2);
+        const bytes = new Uint8Array(hex.length / 2);
+        for (let i = 0; i < bytes.length; i += 1) {
+          bytes[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+        }
+        const text = new TextDecoder().decode(bytes).trim();
+        if (text.startsWith('[') || text.startsWith('{') || /^\d+$/.test(text)) {
+          return unwrapViewResult(text);
+        }
+      } catch {
+        /* keep original */
+      }
+    }
+    if (
+      (trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+      (trimmed.startsWith('[') && trimmed.endsWith(']'))
+    ) {
+      try {
+        return unwrapViewResult(JSON.parse(trimmed));
       } catch {
         return plain;
       }
@@ -119,13 +145,19 @@ export const formatWriteError = (err) => {
   if (low.includes('invalid address') || (low.includes('undefined') && low.includes('address'))) {
     return 'Wallet address was not attached. Reconnect MetaMask on GenLayer Studionet and retry.';
   }
+  if (low.includes('reverted')) {
+    return 'Studionet transaction reverted. Contract state was not changed. Check deposit amount / evidence URLs and retry.';
+  }
+  if (low.includes('timed out') || low.includes('timeout')) {
+    return 'Timed out waiting for Studionet confirmation. If MetaMask already confirmed, wait 30s and hit Refresh — do not resend yet.';
+  }
   return msg || 'Write transaction failed.';
 };
 
 const toValueBigInt = (value) => {
   if (typeof value === 'bigint') return value < 0n ? 0n : value;
   if (typeof value === 'number') return 0n;
-  const raw = String(value || '0x0').trim();
+  const raw = String(value ?? '0').trim();
   if (raw === '' || raw === '0x' || raw === '0x0') return 0n;
   try {
     return BigInt(raw);
@@ -134,69 +166,36 @@ const toValueBigInt = (value) => {
   }
 };
 
-const isHexStub = (val) => typeof val === 'string' && /^0x[0-9a-fA-F]+$/.test(val);
-
-export const encodeGenLayerCalldata = (method, args = []) => {
-  const BITS = 3; const T_SPECIAL = 0; const T_PINT = 1; const T_NINT = 2; const T_STR = 4; const T_ARR = 5; const T_MAP = 6;
-  const SPECIAL_NULL = 0; const SPECIAL_FALSE = 1 << BITS; const SPECIAL_TRUE = 2 << BITS;
-
-  function writeNum(to, n) {
-    if (n === 0n) { to.push(0); return; }
-    while (n > 0) {
-      let cur = Number(n & 0x7fn); n >>= 7n;
-      if (n > 0) cur |= 128;
-      to.push(cur);
-    }
+const extractTxHash = (raw) => {
+  if (!raw) return '';
+  if (typeof raw === 'string') return raw;
+  if (typeof raw === 'object') {
+    return String(raw.hash || raw.transactionHash || raw.txHash || raw.id || '');
   }
-  function encodeNumWithType(to, n, type) { writeNum(to, (n << BigInt(BITS)) | BigInt(type)); }
-  function encodeImpl(to, data) {
-    if (data === null || data === undefined) { to.push(SPECIAL_NULL); return; }
-    if (data === true) { to.push(SPECIAL_TRUE); return; }
-    if (data === false) { to.push(SPECIAL_FALSE); return; }
-    if (typeof data === 'number' || typeof data === 'bigint') {
-      const n = BigInt(data);
-      encodeNumWithType(to, n >= 0n ? n : -n - 1n, n >= 0n ? T_PINT : T_NINT);
-      return;
-    }
-    if (typeof data === 'string') {
-      const str = new TextEncoder().encode(data);
-      encodeNumWithType(to, BigInt(str.length), T_STR);
-      for (const c of str) to.push(c);
-      return;
-    }
-    if (Array.isArray(data)) {
-      encodeNumWithType(to, BigInt(data.length), T_ARR);
-      for (const c of data) encodeImpl(to, c);
-      return;
-    }
-    if (typeof data === 'object') {
-      const keys = Object.keys(data);
-      const entries = keys.map((k) => [new TextEncoder().encode(k), data[k]]);
-      entries.sort((a, b) => {
-        for (let i = 0; i < a[0].length && i < b[0].length; i++) {
-          const diff = a[0][i] - b[0][i];
-          if (diff !== 0) return diff;
-        }
-        return a[0].length - b[0].length;
-      });
-      encodeNumWithType(to, BigInt(entries.length), T_MAP);
-      for (const [k, v] of entries) {
-        writeNum(to, BigInt(k.length));
-        for (const c of k) to.push(c);
-        encodeImpl(to, v);
-      }
-    }
-  }
-
-  const arr = [];
-  encodeImpl(arr, { method, args });
-  return toRlp([toHex(new Uint8Array(arr))]);
+  return String(raw);
 };
 
-const STUDIO_RPC = 'https://studio.genlayer.com/api';
+export const getGenlayerClient = (account) => {
+  try {
+    const cfg = {
+      chain: studioChain(),
+    };
+    const address = toAddress(account);
+    // Hex string (not object) so MetaMask provider routing is enabled in genlayer-js.
+    if (address) cfg.account = address;
+    if (typeof window !== 'undefined' && window.ethereum) {
+      cfg.provider = window.ethereum;
+    }
+    return createClient(cfg);
+  } catch (err) {
+    console.warn('GenLayer client initialization fallback:', err);
+    return null;
+  }
+};
 
 const studioRpc = async (method, params = []) => {
-  const res = await fetch(STUDIO_RPC, {
+  const endpoint = studioRpcUrl(browserOrigin());
+  const res = await fetch(endpoint, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method, params }),
@@ -205,7 +204,7 @@ const studioRpc = async (method, params = []) => {
   return res?.result;
 };
 
-const waitForStudioEvmReceipt = async (txHash, maxRetries = 24, intervalMs = 2000) => {
+const waitForStudioEvmReceipt = async (txHash, maxRetries = 40, intervalMs = 2500) => {
   for (let i = 0; i < maxRetries; i++) {
     const receipt = await studioRpc('eth_getTransactionReceipt', [txHash]).catch(() => null);
     if (receipt) {
@@ -213,7 +212,8 @@ const waitForStudioEvmReceipt = async (txHash, maxRetries = 24, intervalMs = 200
       if (status === '0x0' || status === 0 || status === '0') {
         throw new Error('Studionet transaction reverted. Contract state was not changed.');
       }
-      await new Promise((r) => setTimeout(r, 1500));
+      // Give GenVM a moment after EVM inclusion before reads.
+      await new Promise((r) => setTimeout(r, 2000));
       return receipt;
     }
     await new Promise((r) => setTimeout(r, intervalMs));
@@ -229,33 +229,33 @@ const studionetChainIdHex = () => {
 export const switchToGenlayerStudionet = async () => {
   if (typeof window === 'undefined' || !window.ethereum) return;
   const chainIdHex = studionetChainIdHex();
+  const rpc = studioRpcUrl(window.location.origin);
+  const chain = officialStudionet || studionet;
+
   try {
     await window.ethereum.request({
       method: 'wallet_switchEthereumChain',
       params: [{ chainId: chainIdHex }],
     });
   } catch (switchError) {
-    if (switchError.code === 4902) {
-      try {
-        const chain = officialStudionet || studionet;
-        await window.ethereum.request({
-          method: 'wallet_addEthereumChain',
-          params: [{
-            chainId: chainIdHex,
-            chainName: chain.name || 'GenLayer Studionet',
-            nativeCurrency: chain.nativeCurrency || {
-              name: 'GenLayer Token',
-              symbol: 'GEN',
-              decimals: 18,
-            },
-            rpcUrls: chain.rpcUrls?.default?.http || ['https://studio.genlayer.com/api'],
-            blockExplorerUrls: [chain.blockExplorers?.default?.url || EXPLORER_BASE],
-          }],
-        });
-      } catch (addError) {
-        console.warn('Could not add GenLayer Studionet network to MetaMask:', addError);
-      }
-    }
+    const missing =
+      switchError?.code === 4902 ||
+      String(switchError?.message || '').toLowerCase().includes('unrecognized chain');
+    if (!missing) throw switchError;
+    await window.ethereum.request({
+      method: 'wallet_addEthereumChain',
+      params: [{
+        chainId: chainIdHex,
+        chainName: chain.name || 'GenLayer Studionet',
+        nativeCurrency: chain.nativeCurrency || {
+          name: 'GEN Token',
+          symbol: 'GEN',
+          decimals: 18,
+        },
+        rpcUrls: [rpc],
+        blockExplorerUrls: [chain.blockExplorers?.default?.url || EXPLORER_BASE],
+      }],
+    });
   }
 };
 
@@ -279,6 +279,7 @@ export const sendContractTransaction = async ({
     throw new Error('No connected wallet account found. Please connect MetaMask to execute write actions.');
   }
 
+  // Do not call client.connect('studionet'): it requests a MetaMask Snap and blocks regular wallets.
   await switchToGenlayerStudionet();
 
   const client = getGenlayerClient(sender);
@@ -286,89 +287,119 @@ export const sendContractTransaction = async ({
     throw new Error('GenLayer write client is not available.');
   }
 
+  const valueWei = toValueBigInt(value);
   const writeAccount = toWriteAccount(sender);
+
   try {
-    return await client.writeContract({
+    const raw = await client.writeContract({
+      // Object form required so addTransaction _sender is populated.
       account: writeAccount,
       address: to,
       functionName,
       args,
-      value: toValueBigInt(value),
+      value: valueWei,
     });
+    const hash = extractTxHash(raw);
+    if (!hash) {
+      throw new Error('writeContract returned no transaction hash.');
+    }
+    return hash;
   } catch (err) {
     throw new Error(formatWriteError(err));
   }
 };
 
-export const waitForFinalizedTx = async (txHash, maxRetries = 24, intervalMs = 2000) => {
-  if (!txHash) {
-    throw new Error('Missing transaction hash.');
-  }
+export const waitForFinalizedTx = async (txHash, maxRetries = 40, intervalMs = 2500) => {
+  const hash = extractTxHash(txHash);
+  if (!hash) throw new Error('Missing transaction hash.');
 
   try {
-    return await waitForStudioEvmReceipt(txHash, maxRetries, intervalMs);
+    return await waitForStudioEvmReceipt(hash, maxRetries, intervalMs);
   } catch (studioErr) {
     const studioMsg = String(studioErr?.message || '').toLowerCase();
     if (studioMsg.includes('reverted')) throw studioErr;
+
     const client = getGenlayerClient();
-    if (!client || !client.waitForTransactionReceipt) {
-      throw studioErr;
-    }
-    try {
-      const receipt = await client.waitForTransactionReceipt({
-        hash: txHash,
-        status: TransactionStatus.ACCEPTED,
-        retries: Math.min(maxRetries, 12),
-        interval: intervalMs,
-      });
-      const execName = receipt?.txExecutionResultName || receipt?.executionResult || receipt?.txExecutionResult;
-      if (execName === ExecutionResult.FINISHED_WITH_ERROR) {
-        const detail = receipt?.txExecutionError || receipt?.stderr || receipt?.verdict_reason || '';
-        throw new Error('Contract execution failed. State was not changed. ' + String(detail));
+    if (client && client.waitForTransactionReceipt) {
+      try {
+        const receipt = await client.waitForTransactionReceipt({
+          hash,
+          status: TransactionStatus.ACCEPTED,
+          retries: Math.min(maxRetries, 20),
+          interval: intervalMs,
+        });
+        return receipt;
+      } catch (err) {
+        console.warn('waitForTransactionReceipt note:', err);
       }
-      return receipt;
-    } catch {
-      throw studioErr;
     }
+    // Soft-timeout: allow caller to confirm via on-chain state polling.
+    return { hash, pending: true, warning: String(studioErr?.message || studioErr) };
   }
 };
 
-export const readContractState = async (functionName, args = [], targetAddress) => {
+/**
+ * Poll a view until `predicate(result)` is true, or timeout.
+ * Used after payable writes because Studionet GenVM execution lags the EVM receipt.
+ */
+export const waitForContractEffect = async ({
+  read,
+  predicate,
+  retries = 30,
+  intervalMs = 2000,
+  label = 'contract state',
+}) => {
+  let last = null;
+  for (let i = 0; i < retries; i++) {
+    try {
+      last = await read();
+      if (await predicate(last)) return last;
+    } catch (err) {
+      console.warn(`waitForContractEffect(${label}) read note:`, err);
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  throw new Error(
+    `Timed out waiting for ${label} to update on Studionet. Refresh the page; if state is still unchanged, the transaction did not land.`
+  );
+};
+
+export const readContractState = async (functionName, args = [], targetAddress, fromAddress) => {
   const addr = targetAddress;
   if (!isValidContractAddress(addr)) return null;
+
   try {
-    const client = getGenlayerClient();
+    const client = getGenlayerClient(fromAddress || VIEW_FROM);
     if (client && client.readContract) {
       const result = await client.readContract({
         address: addr,
         functionName,
         args,
+        account: toWriteAccount(fromAddress || VIEW_FROM),
         stateStatus: 'accepted',
       });
-      if (isHexStub(result)) return null;
       return unwrapViewResult(result);
     }
   } catch (err) {
     console.warn(`readContract ${functionName} note:`, err);
   }
 
+  // Fallback: eth_call via same-origin Studio proxy (no custom calldata encoder needed for views).
   try {
-    const calldata = encodeGenLayerCalldata(functionName, args);
-    const res = await fetch(STUDIO_RPC, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'eth_call',
-        params: [{ to: addr, data: calldata }, 'latest'],
-      }),
-    }).then((r) => r.json());
-    return unwrapViewResult(res?.result);
+    const client = getGenlayerClient(VIEW_FROM);
+    if (client && client.readContract) {
+      const result = await client.readContract({
+        address: addr,
+        functionName,
+        args,
+        account: { address: VIEW_FROM },
+      });
+      return unwrapViewResult(result);
+    }
   } catch (err) {
-    console.warn('eth_call RPC error:', err);
-    return null;
+    console.warn(`readContract fallback ${functionName} note:`, err);
   }
+  return null;
 };
 
 export const txExplorerUrl = (hash) => {
