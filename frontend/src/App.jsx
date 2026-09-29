@@ -238,9 +238,10 @@ export default function App() {
         ? 'Validators compare the binary verdict (OVERTURNED vs UPHELD). This can take a minute.'
         : 'Confirm in MetaMask on GenLayer Studionet. Keep this tab open until confirmation finishes.',
     });
+    let hash = '';
     try {
       const before = confirm ? await snapshotConfig() : null;
-      const hash = await sendContractTransaction({
+      hash = await sendContractTransaction({
         from: account,
         to: contractAddress,
         functionName,
@@ -255,7 +256,7 @@ export default function App() {
         hash,
       });
 
-      const receipt = await waitForFinalizedTx(hash, ai ? 90 : 40, ai ? 4000 : 2500);
+      const receipt = await waitForFinalizedTx(hash, ai ? 90 : 60, ai ? 4000 : 3000);
       if (receipt?.pending) {
         setTxMessage({
           status: 'pending',
@@ -274,8 +275,8 @@ export default function App() {
         });
         await waitForContractEffect({
           label: title,
-          retries: ai ? 60 : 36,
-          intervalMs: ai ? 4000 : 2500,
+          retries: ai ? 60 : 48,
+          intervalMs: ai ? 4000 : 3000,
           read: async () => {
             const after = await snapshotConfig();
             return { before, after };
@@ -302,6 +303,7 @@ export default function App() {
         status: 'error',
         title: `${title} failed`,
         detail,
+        hash: hash || undefined,
       });
       // Re-sync UI so a late-landing tx still shows up.
       try { await refreshAll(); } catch { /* ignore */ }
@@ -343,7 +345,7 @@ export default function App() {
       return;
     }
     if (policies.length < 2) {
-      setTxMessage({ status: 'error', title: 'Policy sources required', detail: 'Need at least 2 independent policy reference URLs.' });
+      setTxMessage({ status: 'error', title: 'Policy sources required', detail: 'Need at least 2 authoritative platform policy URLs (official hosts for the selected platform; no duplicates).' });
       return;
     }
     try {
@@ -584,6 +586,7 @@ export default function App() {
             />
 
             <label className="label">Flagged content / ban-notice URLs (min 1)</label>
+            <p className="hint">Must be a real public https page GenLayer can fetch. Placeholder hosts like example.com will fail AI adjudication.</p>
             <div className="chips" style={{ marginBottom: '0.5rem' }}>
               {SAMPLE_FLAGGED_URLS.map((url) => (
                 <button
@@ -612,7 +615,8 @@ export default function App() {
             ))}
             <button type="button" className="btn-ghost" onClick={() => addUrl(flaggedUrls, setFlaggedUrls)}><Plus size={14} /> Add evidence URL</button>
 
-            <label className="label" style={{ marginTop: '1rem' }}>Independent policy reference URLs (min 2)</label>
+            <label className="label" style={{ marginTop: '1rem' }}>Authoritative platform policy URLs (min 2)</label>
+            <p className="hint">Official policy pages for the selected platform only. Duplicates and personal / claimant-controlled sites are rejected on-chain.</p>
             {policyUrls.map((url, i) => (
               <UrlRow
                 key={`p-${i}`}

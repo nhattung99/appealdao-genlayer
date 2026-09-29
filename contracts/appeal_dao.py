@@ -13,6 +13,67 @@ MIN_POLICY_URLS = 2
 RENDER_CHAR_CAP = 2000
 ZERO_ADDR = Address("0x0000000000000000000000000000000000000000")
 
+# Official hosts that may serve as authoritative policy references (by platform).
+# "other" accepts the union of known platform policy hosts only — never claimant sites.
+_PLATFORM_POLICY_HOSTS = {
+    "youtube": (
+        "youtube.com",
+        "www.youtube.com",
+        "support.google.com",
+        "policies.google.com",
+        "google.com",
+    ),
+    "tiktok": (
+        "tiktok.com",
+        "www.tiktok.com",
+        "support.tiktok.com",
+    ),
+    "x": (
+        "x.com",
+        "www.x.com",
+        "help.x.com",
+        "twitter.com",
+        "www.twitter.com",
+        "help.twitter.com",
+    ),
+    "instagram": (
+        "instagram.com",
+        "www.instagram.com",
+        "help.instagram.com",
+        "transparency.meta.com",
+        "facebook.com",
+        "www.facebook.com",
+        "meta.com",
+    ),
+}
+
+# Hosts a claimant can trivially control — never accepted as policy references.
+_CLAIMANT_CONTROLLED_HOST_SUFFIXES = (
+    "example.com",
+    "example.org",
+    "example.net",
+    "localhost",
+    "localtest.me",
+    "github.io",
+    "gitlab.io",
+    "netlify.app",
+    "vercel.app",
+    "pages.dev",
+    "web.app",
+    "firebaseapp.com",
+    "herokuapp.com",
+    "blogspot.com",
+    "blogger.com",
+    "wordpress.com",
+    "tumblr.com",
+    "medium.com",
+    "notion.site",
+    "carrd.co",
+    "linktr.ee",
+    "ngrok.io",
+    "ngrok.app",
+)
+
 
 def _addr_str(a) -> str:
     if isinstance(a, (bytes, bytearray)):
@@ -62,18 +123,189 @@ def _urls_to_list(urls) -> list:
     return out
 
 
-def _clean_http_urls(urls, kind: str, minimum: int) -> list:
+def _platform_key(platform_name: str) -> str:
+    n = str(platform_name or "").strip().lower()
+    if "youtube" in n or n == "yt":
+        return "youtube"
+    if "tiktok" in n:
+        return "tiktok"
+    if n in ("x", "twitter", "x.com") or "twitter" in n:
+        return "x"
+    if "instagram" in n or n in ("ig", "insta"):
+        return "instagram"
+    return "other"
+
+
+def _url_host(url: str) -> str:
+    s = str(url).strip().lower()
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    s = s.split("/", 1)[0]
+    s = s.split("?", 1)[0]
+    s = s.split("#", 1)[0]
+    if "@" in s:
+        s = s.split("@")[-1]
+    if s.startswith("[") and "]" in s:
+        # IPv6 literal — treat as non-authoritative
+        return s
+    if ":" in s:
+        s = s.split(":", 1)[0]
+    return s
+
+
+def _normalize_url_key(url: str) -> str:
+    s = str(url).strip().lower()
+    if "://" in s:
+        scheme, rest = s.split("://", 1)
+    else:
+        scheme, rest = "https", s
+    rest = rest.split("#", 1)[0]
+    rest = rest.split("?", 1)[0]
+    while rest.endswith("/"):
+        rest = rest[:-1]
+    return scheme + "://" + rest
+
+
+def _host_matches(host: str, allowed) -> bool:
+    h = str(host or "").lower()
+    if not h:
+        return False
+    for raw in allowed:
+        a = str(raw).lower()
+        if h == a or h.endswith("." + a):
+            return True
+    return False
+
+
+def _is_ip_host(host: str) -> bool:
+    h = str(host or "")
+    if not h:
+        return True
+    if h.startswith("["):
+        return True
+    parts = h.split(".")
+    if len(parts) == 4:
+        all_digits = True
+        for p in parts:
+            if not p.isdigit():
+                all_digits = False
+                break
+            if int(p) > 255:
+                all_digits = False
+                break
+        if all_digits:
+            return True
+    return False
+
+
+def _is_claimant_controlled_host(host: str) -> bool:
+    h = str(host or "").lower()
+    if not h or h == "localhost":
+        return True
+    if _is_ip_host(h):
+        return True
+    for suffix in _CLAIMANT_CONTROLLED_HOST_SUFFIXES:
+        if h == suffix or h.endswith("." + suffix):
+            return True
+    return False
+
+
+def _authoritative_policy_hosts(platform_name: str) -> list:
+    key = _platform_key(platform_name)
+    if key in _PLATFORM_POLICY_HOSTS:
+        return list(_PLATFORM_POLICY_HOSTS[key])
+    # "Other" — only known official platform policy hosts (union).
+    out = []
+    for hosts in _PLATFORM_POLICY_HOSTS.values():
+        for h in hosts:
+            if h not in out:
+                out.append(h)
+    return out
+
+
+def _clean_flagged_urls(urls, minimum: int) -> list:
     cleaned = []
+    seen = {}
     for u in urls:
         url = str(u).strip()
         if not url:
             continue
         if not (url.startswith("http://") or url.startswith("https://")):
-            raise UserError("Invalid " + kind + " URL: must start with http:// or https://")
+            raise UserError("Invalid flagged content URL: must start with http:// or https://")
+        key = _normalize_url_key(url)
+        if key in seen:
+            raise UserError("Duplicate flagged content URL rejected: " + url)
+        seen[key] = True
         cleaned.append(url)
     if len(cleaned) < minimum:
-        raise UserError("At least " + str(minimum) + " " + kind + " URL(s) required")
+        raise UserError("At least " + str(minimum) + " flagged content URL(s) required")
     return cleaned
+
+
+def _clean_policy_urls(urls, platform_name: str, flagged_urls, minimum: int) -> list:
+    """Bind policy refs to authoritative platform hosts; reject dups and claimant-controlled sites."""
+    allowed = _authoritative_policy_hosts(platform_name)
+    flagged_hosts = {}
+    for f in flagged_urls:
+        flagged_hosts[_url_host(f)] = True
+
+    cleaned = []
+    seen = {}
+    for u in urls:
+        url = str(u).strip()
+        if not url:
+            continue
+        if not (url.startswith("http://") or url.startswith("https://")):
+            raise UserError("Invalid policy reference URL: must start with http:// or https://")
+        key = _normalize_url_key(url)
+        if key in seen:
+            raise UserError("Duplicate policy reference URL rejected: " + url)
+        seen[key] = True
+
+        host = _url_host(url)
+        if _is_claimant_controlled_host(host):
+            raise UserError(
+                "Policy reference must be an authoritative platform source, not claimant-controlled: " + url
+            )
+        if host in flagged_hosts:
+            raise UserError(
+                "Policy reference cannot share a host with flagged evidence (claimant-controlled risk): " + url
+            )
+        if not _host_matches(host, allowed):
+            raise UserError(
+                "Policy reference is not an authoritative host for platform '"
+                + str(platform_name).strip()
+                + "': "
+                + url
+            )
+        cleaned.append(url)
+
+    if len(cleaned) < minimum:
+        raise UserError("At least " + str(minimum) + " policy reference URL(s) required")
+    return cleaned
+
+
+def _settlement_confidence_ok(confidence) -> bool:
+    try:
+        conf = int(confidence)
+    except Exception:
+        conf = 0
+    return conf >= MIN_CONFIDENCE
+
+
+def _validator_agrees_on_settlement(leader_val: dict, validator_val: dict) -> bool:
+    """Validators must agree on verdict and on whether confidence clears the settlement threshold."""
+    if not isinstance(leader_val, dict) or not isinstance(validator_val, dict):
+        return False
+    lv = str(leader_val.get("verdict", "")).strip().upper()
+    vv = str(validator_val.get("verdict", "")).strip().upper()
+    if lv != vv:
+        return False
+    if lv not in VALID_VERDICTS:
+        return False
+    return _settlement_confidence_ok(leader_val.get("confidence", 0)) == _settlement_confidence_ok(
+        validator_val.get("confidence", 0)
+    )
 
 
 def _leader_payload(leader_res):
@@ -210,7 +442,7 @@ class Contract(gl.Contract):
         self.appeal_deposit_amount = appeal_deposit_amount
         self.overturned_bonus_amount = overturned_bonus_amount
 
-    @gl.public.write
+    @gl.public.write.payable
     def fund_pool(self) -> None:
         """Anyone can contribute to the mutual-aid community pool."""
         amount = bigint(gl.message.value)
@@ -218,7 +450,7 @@ class Contract(gl.Contract):
             raise UserError("Must send GEN to fund the pool")
         self.pool_balance = self.pool_balance + amount
 
-    @gl.public.write
+    @gl.public.write.payable
     def file_appeal(
         self,
         platform_name: str,
@@ -236,8 +468,10 @@ class Contract(gl.Contract):
         if not content_description or len(str(content_description).strip()) == 0:
             raise UserError("Content description cannot be empty")
 
-        flagged = _clean_http_urls(flagged_content_urls, "flagged content", MIN_FLAGGED_URLS)
-        policies = _clean_http_urls(policy_reference_urls, "policy reference", MIN_POLICY_URLS)
+        flagged = _clean_flagged_urls(flagged_content_urls, MIN_FLAGGED_URLS)
+        policies = _clean_policy_urls(
+            policy_reference_urls, str(platform_name).strip(), flagged, MIN_POLICY_URLS
+        )
 
         appeal_id = str(self.appeal_counter)
         self.appeal_counter = self.appeal_counter + bigint(1)
@@ -273,8 +507,28 @@ class Contract(gl.Contract):
         if a.status != "DISPUTED":
             raise UserError("Can only add evidence to DISPUTED appeals, current status: " + a.status)
 
-        extra_flagged = _clean_http_urls(additional_flagged_urls, "flagged content", 0)
-        extra_policy = _clean_http_urls(additional_policy_urls, "policy reference", 0)
+        extra_flagged = _clean_flagged_urls(additional_flagged_urls, 0)
+        existing_flagged = _urls_to_list(a.flagged_content_urls)
+        # Re-run duplicate checks against existing flagged set by concatenating then cleaning min 0
+        # after a lightweight cross-check:
+        for url in extra_flagged:
+            key = _normalize_url_key(url)
+            for existing in existing_flagged:
+                if _normalize_url_key(existing) == key:
+                    raise UserError("Duplicate flagged content URL rejected: " + url)
+
+        combined_flagged = existing_flagged + extra_flagged
+        extra_policy = _clean_policy_urls(
+            additional_policy_urls, a.platform_name, combined_flagged, 0
+        )
+        # Also reject policies that duplicate already-stored policy URLs
+        existing_policies = _urls_to_list(a.policy_reference_urls)
+        for url in extra_policy:
+            key = _normalize_url_key(url)
+            for existing in existing_policies:
+                if _normalize_url_key(existing) == key:
+                    raise UserError("Duplicate policy reference URL rejected: " + url)
+
         if len(extra_flagged) < 1 and len(extra_policy) < 1:
             raise UserError("At least 1 additional URL is required")
 
@@ -334,7 +588,9 @@ Return ONLY raw JSON, no markdown:
                 my_res = leader_fn()
             except Exception:
                 return False
-            return str(my_res.get("verdict", "")).upper() == str(leader_val.get("verdict", "")).upper()
+            # Absolute agreement on verdict AND settlement-relevant confidence band
+            # (whether confidence clears MIN_CONFIDENCE and unlocks payout settlement).
+            return _validator_agrees_on_settlement(leader_val, my_res)
 
         result = _extract_result(gl.vm.run_nondet(leader_fn, validator_fn))
 
@@ -350,7 +606,7 @@ Return ONLY raw JSON, no markdown:
         a.confidence = u256(conf_int)
         a.verdict_reason = str(result.get("reason", ""))
 
-        if conf_int < MIN_CONFIDENCE or a.verdict not in VALID_VERDICTS:
+        if not _settlement_confidence_ok(conf_int) or a.verdict not in VALID_VERDICTS:
             a.status = "DISPUTED"
             self.appeals[appeal_id] = a
             return
@@ -384,7 +640,12 @@ Return ONLY raw JSON, no markdown:
 
     @gl.public.write
     def retry_resolution(self, appeal_id: str) -> None:
-        """Retry payout if PAYOUT_FAILED. Reuses locked final_payout_amount — no AI, no bonus recalc."""
+        """Retry payout if PAYOUT_FAILED.
+
+        Reuses the locked verdict economics but re-debits the bonus portion from
+        `pool_balance` on success so recorded pool cannot sit above available funds.
+        If the pool shrank since the failed payout, the bonus is capped to what remains.
+        """
         if appeal_id not in self.appeals:
             raise UserError("Appeal does not exist")
         a = self.appeals[appeal_id]
@@ -393,11 +654,28 @@ Return ONLY raw JSON, no markdown:
         if a.status != "PAYOUT_FAILED":
             raise UserError("Can only retry PAYOUT_FAILED appeals")
 
+        locked = a.final_payout_amount
+        deposit = a.deposit_paid
+        bonus_due = locked - deposit
+        if bonus_due < bigint(0):
+            bonus_due = bigint(0)
+
+        # Cap to available pool so accounting never claims more bonus than remains.
+        if bonus_due > self.pool_balance:
+            bonus_due = self.pool_balance
+            locked = deposit + bonus_due
+            a.final_payout_amount = locked
+
+        if bonus_due > bigint(0):
+            self.pool_balance = self.pool_balance - bonus_due
+
         try:
-            _pay(a.creator, a.final_payout_amount)
+            _pay(a.creator, locked)
             a.settled = True
             a.status = "RESOLVED_OVERTURNED"
         except Exception as e:
+            if bonus_due > bigint(0):
+                self.pool_balance = self.pool_balance + bonus_due
             a.verdict_reason += " (Retry failed again: " + str(e) + ")"
         self.appeals[appeal_id] = a
 

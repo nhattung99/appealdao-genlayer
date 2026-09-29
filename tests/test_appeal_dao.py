@@ -272,6 +272,216 @@ def test_missing_evidence_and_policy_urls_blocked(direct_vm, direct_deploy, dire
     _clear_value(vm)
 
 
+def test_reject_duplicate_and_claimant_controlled_policy_references(
+    direct_vm, direct_deploy, direct_accounts
+):
+    """Steward: reject duplicate or claimant-controlled policy references; bind to authoritative hosts."""
+    contract, vm, owner, creator, _extra = _boot(direct_vm, direct_deploy, direct_accounts)
+    _setup(contract, vm, owner)
+
+    _as(vm, creator)
+    _set_value(vm, DEPOSIT)
+
+    # Duplicate policy URLs (including trailing-slash variants)
+    with pytest.raises(Exception):
+        contract.file_appeal(
+            "YouTube",
+            "desc",
+            [FLAGGED],
+            [POLICY_1, POLICY_1],
+        )
+    with pytest.raises(Exception):
+        contract.file_appeal(
+            "YouTube",
+            "desc",
+            [FLAGGED],
+            [
+                "https://www.youtube.com/howyoutubeworks/policies/community-guidelines/",
+                "https://www.youtube.com/howyoutubeworks/policies/community-guidelines",
+            ],
+        )
+
+    # Duplicate flagged URLs
+    with pytest.raises(Exception):
+        contract.file_appeal(
+            "YouTube",
+            "desc",
+            [FLAGGED, FLAGGED],
+            [POLICY_1, POLICY_2],
+        )
+
+    # Claimant-controlled / non-authoritative policy hosts
+    with pytest.raises(Exception):
+        contract.file_appeal(
+            "YouTube",
+            "desc",
+            [FLAGGED],
+            [POLICY_1, "https://example.com/my-fake-policy"],
+        )
+    with pytest.raises(Exception):
+        contract.file_appeal(
+            "YouTube",
+            "desc",
+            [FLAGGED],
+            [POLICY_1, "https://claimant.github.io/youtube-policy"],
+        )
+    with pytest.raises(Exception):
+        contract.file_appeal(
+            "YouTube",
+            "desc",
+            [FLAGGED],
+            [POLICY_1, "https://help.x.com/en/rules-and-policies/x-rules"],  # wrong platform
+        )
+
+    # Policy sharing host with flagged evidence (claimant-controlled risk)
+    with pytest.raises(Exception):
+        contract.file_appeal(
+            "YouTube",
+            "desc",
+            ["https://support.google.com/youtube/answer/ban-notice"],
+            [POLICY_1, POLICY_2],
+        )
+
+    _clear_value(vm)
+
+    # Authoritative YouTube policies still accepted
+    appeal_id = _file(contract, vm, creator)
+    assert appeal_id == "0"
+    row = _appeal(contract, appeal_id)
+    assert POLICY_1 in row["policy_reference_urls"]
+    assert POLICY_2 in row["policy_reference_urls"]
+
+
+def test_confidence_threshold_is_settlement_relevant(direct_vm, direct_deploy, direct_accounts):
+    """Confidence below MIN_CONFIDENCE (60) must not settle; at/above threshold may settle."""
+    contract, vm, owner, creator, _extra = _boot(direct_vm, direct_deploy, direct_accounts)
+    _setup(contract, vm, owner, pool=POOL_FULL)
+
+    low_id = _file(contract, vm, creator, desc="Borderline low confidence case")
+    _as(vm, creator)
+    _resolve(contract, vm, low_id, "OVERTURNED", 59, "Just below settlement threshold")
+    low = _appeal(contract, low_id)
+    assert low["status"] == "DISPUTED"
+    assert int(low["confidence"]) == 59
+    assert low["settled"] is False
+    assert _pool(contract) == POOL_FULL
+
+    ok_id = _file(contract, vm, creator, desc="Borderline passing confidence case")
+    _as(vm, creator)
+    _resolve(contract, vm, ok_id, "OVERTURNED", 60, "Meets settlement confidence threshold")
+    ok = _appeal(contract, ok_id)
+    assert ok["status"] == "RESOLVED_OVERTURNED"
+    assert int(ok["confidence"]) == 60
+    assert ok["settled"] is True
+    assert int(ok["final_payout_amount"]) == DEPOSIT + BONUS
+    assert _pool(contract) == POOL_FULL - BONUS
+
+
+def test_retry_success_cannot_leave_pool_above_available_funds(
+    direct_vm, direct_deploy, direct_accounts, monkeypatch
+):
+    """After PAYOUT_FAILED, a successful retry must debit bonus so pool accounting stays honest."""
+    contract, vm, owner, creator, _extra = _boot(direct_vm, direct_deploy, direct_accounts)
+    _setup(contract, vm, owner, pool=POOL_FULL)
+
+    appeal_id = _file(contract, vm, creator)
+    locked_payout = DEPOSIT + BONUS
+
+    import gltest.direct.loader
+    original_emit = gltest.direct.loader._EOAProxy.emit_transfer
+
+    def failing_emit_transfer(self, value=None, **kwargs):
+        raise Exception("Simulated native transfer execution failure")
+
+    monkeypatch.setattr(gltest.direct.loader._EOAProxy, "emit_transfer", failing_emit_transfer)
+    _as(vm, creator)
+    _resolve(contract, vm, appeal_id, "OVERTURNED", 97, "Ban was incorrect")
+    assert _appeal(contract, appeal_id)["status"] == "PAYOUT_FAILED"
+    assert _pool(contract) == POOL_FULL  # bonus rolled back on failure
+
+    # Drain some of the pool before retry via a successful overturned appeal.
+    monkeypatch.undo()
+
+    # Consume BONUS from pool via a successful overturned appeal.
+    second_id = _file(contract, vm, creator, desc="Second appeal consumes pool bonus")
+    _as(vm, creator)
+    _resolve(contract, vm, second_id, "OVERTURNED", 90, "Second win")
+    assert _appeal(contract, second_id)["status"] == "RESOLVED_OVERTURNED"
+    pool_before_retry = _pool(contract)
+    assert pool_before_retry == POOL_FULL - BONUS  # 450
+
+    payments = []
+
+    def recording_emit(self, value=None, **kwargs):
+        payments.append(int(value or 0))
+        return original_emit(self, value, **kwargs)
+
+    monkeypatch.setattr(gltest.direct.loader._EOAProxy, "emit_transfer", recording_emit)
+    _as(vm, creator)
+    contract.retry_resolution(appeal_id)
+
+    row = _appeal(contract, appeal_id)
+    assert row["status"] == "RESOLVED_OVERTURNED"
+    assert row["settled"] is True
+    # Full locked bonus still available (450 >= 50), so payout stays locked amount.
+    assert int(row["final_payout_amount"]) == locked_payout
+    assert payments == [locked_payout]
+    assert _pool(contract) == pool_before_retry - BONUS
+    # Invariant: recorded pool never exceeds what a steward would treat as available after payout.
+    assert _pool(contract) >= 0
+
+
+def test_retry_caps_bonus_when_pool_is_short(
+    direct_vm, direct_deploy, direct_accounts, monkeypatch
+):
+    contract, vm, owner, creator, _extra = _boot(direct_vm, direct_deploy, direct_accounts)
+    # Small pool: bonus config 50, pool only 15 — first resolve locks deposit+15, fails transfer,
+    # rolls bonus back so pool=15 again; then drain pool to 5 before retry.
+    _setup(contract, vm, owner, deposit=DEPOSIT, bonus=BONUS, pool=15)
+
+    appeal_id = _file(contract, vm, creator)
+    import gltest.direct.loader
+    original_emit = gltest.direct.loader._EOAProxy.emit_transfer
+
+    def failing_emit_transfer(self, value=None, **kwargs):
+        raise Exception("Simulated native transfer execution failure")
+
+    monkeypatch.setattr(gltest.direct.loader._EOAProxy, "emit_transfer", failing_emit_transfer)
+    _as(vm, creator)
+    _resolve(contract, vm, appeal_id, "OVERTURNED", 95, "Should lock capped bonus")
+    row = _appeal(contract, appeal_id)
+    assert row["status"] == "PAYOUT_FAILED"
+    assert int(row["final_payout_amount"]) == DEPOSIT + 15
+    assert _pool(contract) == 15
+
+    monkeypatch.undo()
+
+    # Drain pool below locked bonus via a successful overturned with remaining 15.
+    # File another appeal; pool has 15, bonus config 50 → caps to 15, pool→0.
+    other_id = _file(contract, vm, creator, desc="Consumes remaining pool")
+    _as(vm, creator)
+    _resolve(contract, vm, other_id, "OVERTURNED", 90, "Takes remaining pool")
+    assert _pool(contract) == 0
+
+    payments = []
+
+    def recording_emit(self, value=None, **kwargs):
+        payments.append(int(value or 0))
+        return original_emit(self, value, **kwargs)
+
+    monkeypatch.setattr(gltest.direct.loader._EOAProxy, "emit_transfer", recording_emit)
+    _as(vm, creator)
+    contract.retry_resolution(appeal_id)
+
+    row = _appeal(contract, appeal_id)
+    assert row["status"] == "RESOLVED_OVERTURNED"
+    assert row["settled"] is True
+    # Bonus capped to 0 available → payout is deposit only; pool stays 0 (not inflated).
+    assert int(row["final_payout_amount"]) == DEPOSIT
+    assert payments == [DEPOSIT]
+    assert _pool(contract) == 0
+
+
 def test_happy_path_overturned_full_bonus(direct_vm, direct_deploy, direct_accounts):
     contract, vm, owner, creator, _extra = _boot(direct_vm, direct_deploy, direct_accounts)
     _setup(contract, vm, owner, pool=POOL_FULL)
@@ -456,6 +666,8 @@ def test_transfer_fail_rolls_back_bonus_then_retry_uses_locked_payout(
     assert row["settled"] is True
     assert int(row["final_payout_amount"]) == locked_payout
     assert payments == [locked_payout]
+    # Successful retry must re-debit the bonus so recorded pool matches available funds.
+    assert _pool(contract) == POOL_FULL - BONUS
 
 
 def test_retry_blocked_unless_payout_failed(direct_vm, direct_deploy, direct_accounts):

@@ -41,9 +41,11 @@ export const PLATFORMS = [
   },
 ];
 
+// Public pages GenLayer can fetch (do NOT use example.com — web.render fails).
+// Hosts must differ from each platform's authoritative policy hosts.
 export const SAMPLE_FLAGGED_URLS = [
-  'https://example.com/ban-notice',
-  'https://archive.example.com/original-content',
+  'https://en.wikipedia.org/wiki/YouTube',
+  'https://en.wikipedia.org/wiki/Content_moderation',
 ];
 
 export const FUND_PRESETS = ['1', '5', '10', '50'];

@@ -148,6 +148,15 @@ export const formatWriteError = (err) => {
   if (low.includes('reverted')) {
     return 'Studionet transaction reverted. Contract state was not changed. Check deposit amount / evidence URLs and retry.';
   }
+  if (low.includes('did not update') || low.includes('state unchanged') || low.includes('to update on studionet')) {
+    return 'Studionet accepted the wallet prompt but contract storage did not change. Hit Refresh once. If pool/appeals are still unchanged, the GenVM call failed — check wallet GEN balance (exact deposit + gas) and retry.';
+  }
+  if (low.includes('canceled') || low.includes('cancelled')) {
+    return 'Studionet marked the transaction CANCELED. Do not assume it landed — Refresh, then retry if state is unchanged.';
+  }
+  if (low.includes('leader_timeout') || low.includes('validators_timeout')) {
+    return 'Studionet consensus timed out before GenVM finished. Wait ~30s, Refresh, and only resend if state is still unchanged.';
+  }
   if (low.includes('timed out') || low.includes('timeout')) {
     return 'Timed out waiting for Studionet confirmation. If MetaMask already confirmed, wait 30s and hit Refresh — do not resend yet.';
   }
@@ -204,19 +213,92 @@ const studioRpc = async (method, params = []) => {
   return res?.result;
 };
 
-const waitForStudioEvmReceipt = async (txHash, maxRetries = 40, intervalMs = 2500) => {
+const SUCCESS_TX_STATUSES = new Set([
+  'ACCEPTED',
+  'FINALIZED',
+  'READY_TO_FINALIZE',
+]);
+const FAILURE_TX_STATUSES = new Set([
+  'CANCELED',
+  'UNDETERMINED',
+  'VALIDATORS_TIMEOUT',
+  'LEADER_TIMEOUT',
+]);
+
+const normalizeTxStatus = (raw) => {
+  if (raw == null) return '';
+  if (typeof raw === 'object') {
+    return String(raw.status || raw.statusName || raw.result || '').toUpperCase();
+  }
+  const s = String(raw).trim();
+  if (/^\d+$/.test(s)) {
+    const map = {
+      5: 'ACCEPTED',
+      6: 'UNDETERMINED',
+      7: 'FINALIZED',
+      8: 'CANCELED',
+      11: 'READY_TO_FINALIZE',
+      12: 'VALIDATORS_TIMEOUT',
+      13: 'LEADER_TIMEOUT',
+    };
+    return map[Number(s)] || s;
+  }
+  return s.toUpperCase();
+};
+
+/**
+ * Studionet writeContract returns the simulator tx hash immediately (isStudio).
+ * Poll gen_getTransactionStatus with a plain hash string — object `{txId}` breaks Studio SQL.
+ * eth_getTransactionReceipt alone often never resolves for these hashes.
+ */
+const waitForStudioTx = async (txHash, maxRetries = 60, intervalMs = 3000) => {
+  let lastStatus = '';
+  let sawTx = false;
+
   for (let i = 0; i < maxRetries; i++) {
+    // Studio expects [hash], not [{ txId: hash }].
+    const genStatus = await studioRpc('gen_getTransactionStatus', [txHash]).catch((err) => {
+      const msg = String(err?.message || err || '');
+      if (msg.toLowerCase().includes('not found')) return null;
+      console.warn('gen_getTransactionStatus note:', err);
+      return null;
+    });
+
+    if (genStatus != null) {
+      sawTx = true;
+      const status = normalizeTxStatus(genStatus);
+      lastStatus = status || lastStatus;
+      if (SUCCESS_TX_STATUSES.has(status)) {
+        await new Promise((r) => setTimeout(r, 1500));
+        return { hash: txHash, status, genStatus };
+      }
+      if (FAILURE_TX_STATUSES.has(status)) {
+        throw new Error(
+          `Studionet transaction ended as ${status}. Contract state was not changed.`
+        );
+      }
+    }
+
     const receipt = await studioRpc('eth_getTransactionReceipt', [txHash]).catch(() => null);
     if (receipt) {
+      sawTx = true;
       const status = receipt.status;
       if (status === '0x0' || status === 0 || status === '0') {
         throw new Error('Studionet transaction reverted. Contract state was not changed.');
       }
-      // Give GenVM a moment after EVM inclusion before reads.
-      await new Promise((r) => setTimeout(r, 2000));
-      return receipt;
+      // EVM inclusion only — keep polling Gen status unless already decided above.
+      if (!lastStatus || lastStatus === 'PENDING' || lastStatus === 'PROPOSING') {
+        lastStatus = 'EVM_INCLUDED';
+      }
     }
+
     await new Promise((r) => setTimeout(r, intervalMs));
+  }
+
+  if (sawTx) {
+    throw new Error(
+      `Timed out waiting for Studionet tx ${txHash} (last status: ${lastStatus || 'unknown'}).`
+    );
   }
   throw new Error(`Timed out waiting for Studionet receipt ${txHash}.`);
 };
@@ -309,15 +391,24 @@ export const sendContractTransaction = async ({
   }
 };
 
-export const waitForFinalizedTx = async (txHash, maxRetries = 40, intervalMs = 2500) => {
+export const waitForFinalizedTx = async (txHash, maxRetries = 60, intervalMs = 3000) => {
   const hash = extractTxHash(txHash);
   if (!hash) throw new Error('Missing transaction hash.');
 
   try {
-    return await waitForStudioEvmReceipt(hash, maxRetries, intervalMs);
+    return await waitForStudioTx(hash, maxRetries, intervalMs);
   } catch (studioErr) {
     const studioMsg = String(studioErr?.message || '').toLowerCase();
-    if (studioMsg.includes('reverted')) throw studioErr;
+    if (
+      studioMsg.includes('reverted') ||
+      studioMsg.includes('ended as') ||
+      studioMsg.includes('canceled') ||
+      studioMsg.includes('undetermined') ||
+      studioMsg.includes('leader_timeout') ||
+      studioMsg.includes('validators_timeout')
+    ) {
+      throw studioErr;
+    }
 
     const client = getGenlayerClient();
     if (client && client.waitForTransactionReceipt) {
@@ -325,7 +416,7 @@ export const waitForFinalizedTx = async (txHash, maxRetries = 40, intervalMs = 2
         const receipt = await client.waitForTransactionReceipt({
           hash,
           status: TransactionStatus.ACCEPTED,
-          retries: Math.min(maxRetries, 20),
+          retries: Math.min(maxRetries, 40),
           interval: intervalMs,
         });
         return receipt;
@@ -360,7 +451,7 @@ export const waitForContractEffect = async ({
     await new Promise((r) => setTimeout(r, intervalMs));
   }
   throw new Error(
-    `Timed out waiting for ${label} to update on Studionet. Refresh the page; if state is still unchanged, the transaction did not land.`
+    `Timed out waiting for ${label} to update on Studionet (state unchanged). Refresh the page; if values are still the same, the GenVM call did not land — do not assume success.`
   );
 };
 

@@ -12,9 +12,9 @@ Do **not** switch the app to Asimov/Bradbury testnet. Studionet only.
 4. Click **Deploy**. Open the transaction and confirm **`Result: SUCCESS`** — `FINALIZED` alone is not enough.
 5. Copy the address into `frontend/.env`:
    ```
-   VITE_CONTRACT_ADDRESS=0x8116D8Eaeb6062F060B8fAbC0fa8249A61e9DdbC
+   VITE_CONTRACT_ADDRESS=0xa7811026685d8d1Bb1d65f77965B9A465668B4aA
    ```
 6. Call `set_config(appeal_deposit_amount, overturned_bonus_amount)` from the owner wallet (both amounts in wei, both > 0) before filing appeals.
 7. Fund MetaMask from Studio → **Accounts** (not the public testnet faucet).
 
-Current Studionet deployment: [`0x8116D8Eaeb6062F060B8fAbC0fa8249A61e9DdbC`](https://genlayer-explorer.vercel.app/address/0x8116D8Eaeb6062F060B8fAbC0fa8249A61e9DdbC).
+Current Studionet deployment: [`0xa7811026685d8d1Bb1d65f77965B9A465668B4aA`](https://explorer-studio.genlayer.com/address/0xa7811026685d8d1Bb1d65f77965B9A465668B4aA).

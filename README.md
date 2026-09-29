@@ -27,8 +27,8 @@ This dApp is deployed against **hosted GenLayer Studionet**. It is **not** deplo
 
 ## Deployed Contract (Studionet)
 
-- **Address:** `0x8116D8Eaeb6062F060B8fAbC0fa8249A61e9DdbC`
-- **Explorer:** [https://genlayer-explorer.vercel.app/address/0x8116D8Eaeb6062F060B8fAbC0fa8249A61e9DdbC](https://genlayer-explorer.vercel.app/address/0x8116D8Eaeb6062F060B8fAbC0fa8249A61e9DdbC)
+- **Address:** `0xa7811026685d8d1Bb1d65f77965B9A465668B4aA`
+- **Explorer:** [https://explorer-studio.genlayer.com/address/0xa7811026685d8d1Bb1d65f77965B9A465668B4aA](https://explorer-studio.genlayer.com/address/0xa7811026685d8d1Bb1d65f77965B9A465668B4aA)
 
 ---
 
@@ -47,7 +47,7 @@ One Intelligent Contract holds both the community pool and every appeal deposit.
 
 - Caller: `gl.message.sender_address` (not `gl.message.sender`)
 - Native GEN out: `gl.get_contract_at(recipient).emit_transfer(value=u256(amount))` (not `gl.transfer`)
-- Native GEN in: `@gl.public.write` + `gl.message.value` (there is no `@gl.public.write.payable`)
+- Native GEN in: `@gl.public.write.payable` + `gl.message.value`
 - Map default: `TreeMap.get(key, default)`
 - Header:
   ```python
@@ -59,11 +59,11 @@ One Intelligent Contract holds both the community pool and every appeal deposit.
 
 1. Owner calls `set_config(deposit_wei, bonus_wei)` — both must be `> 0`.
 2. Anyone calls `fund_pool` with GEN. That amount is added to `pool_balance`.
-3. Creator calls `file_appeal` with **exactly** `appeal_deposit_amount`, a platform name, a description, ≥1 flagged-content URL, and ≥2 independent policy URLs.
-4. Anyone calls `resolve_appeal`. Leader fetches the URLs, prompts the model, returns `OVERTURNED | UPHELD`. Validators agree on the **verdict string only** (absolute compare, no tolerance).
+3. Creator calls `file_appeal` with **exactly** `appeal_deposit_amount`, a platform name, a description, ≥1 flagged-content URL, and ≥2 **authoritative** policy reference URLs for that platform. Duplicate URLs and claimant-controlled policy hosts (personal sites, `example.com`, same host as flagged evidence, etc.) are rejected.
+4. Anyone calls `resolve_appeal`. Leader fetches the URLs, prompts the model, returns `OVERTURNED | UPHELD` plus confidence. Validators agree on the **verdict string** and on the **settlement-relevant confidence outcome** (whether confidence clears the 60 threshold) — absolute compare, no tolerance.
 5. `confidence < 60` or an invalid verdict → `DISPUTED`. Creator may `add_evidence` and resolve again.
 6. `UPHELD` → `pool_balance += deposit`. No transfer.
-7. `OVERTURNED` → `bonus = min(overturned_bonus_amount, pool_balance)`, pay `deposit + bonus`. If `emit_transfer` fails, the bonus debit is rolled back, status becomes `PAYOUT_FAILED`, and `retry_resolution` pays the **locked** `final_payout_amount` (no AI, no bonus recalc).
+7. `OVERTURNED` → `bonus = min(overturned_bonus_amount, pool_balance)`, pay `deposit + bonus`. If `emit_transfer` fails, the bonus debit is rolled back, status becomes `PAYOUT_FAILED`, and `retry_resolution` re-debits the bonus (capped to the current pool) then pays — so a successful retry cannot leave recorded `pool_balance` above available funds.
 
 ---
 
@@ -80,7 +80,7 @@ Every GEN amount is **integer wei** (`1 GEN = 10^18`). There is no `float`, `par
 | `resolve_appeal` OVERTURNED bonus | capped bonus | wei `bigint` | `bonus = bonus_config if bonus_config <= pool_balance else pool_balance` (integer min, not a %) |
 | `resolve_appeal` OVERTURNED payout | creator payment | wei `bigint` | `total = deposit_paid + bonus`. Transfer via `emit_transfer`. |
 | Transfer failure | rollback | wei `bigint` | If transfer throws, `pool_balance += bonus` (only the bonus that was just subtracted). `final_payout_amount` stays locked. |
-| `retry_resolution` | locked payout | wei `bigint` | Transfers `final_payout_amount` as stored at resolve time. Does not re-read `pool_balance` to change the bonus. |
+| `retry_resolution` | locked payout + pool re-debit | wei `bigint` | Re-debits `min(locked_bonus, pool_balance)` from `pool_balance`, then transfers `deposit_paid + that`. Caps `final_payout_amount` if the pool shrank. On transfer failure, restores the debit. |
 | Views (`get_config`, `get_appeal`, `get_pool_balance`) | all money fields | **decimal string** of wei | `str(bigint)` so JSON never uses IEEE-754 numbers. |
 | Frontend `parseGenToWei` | GEN string → wei | `BigInt` | Split on `.`, pad/trim 18 fractional digits, concatenate, `BigInt(...)`. |
 | Frontend `formatWeiToGen` | wei → GEN string | string | `wei / 10^18` and `wei % 10^18` with `BigInt`. Trailing zeros stripped. JS `number` inputs rejected. |
@@ -108,11 +108,11 @@ Required cases:
 2. Happy path `OVERTURNED` with a short pool → creator receives deposit + `min(bonus, pool)`; tx does not fail.
 3. Happy path `UPHELD` → deposit added to pool, no transfer.
 4. Wrong deposit (too low / too high) blocked.
-5. Missing flagged URL / fewer than 2 policy URLs blocked.
-6. `confidence < 60` → `DISPUTED` → `add_evidence` → resolve again.
+5. Missing flagged URL / fewer than 2 policy URLs blocked. Duplicate URLs and non-authoritative / claimant-controlled policy hosts blocked.
+6. `confidence < 60` → `DISPUTED` → `add_evidence` → resolve again. `confidence == 60` may settle.
 7. Broken LLM JSON → `DISPUTED`. Unfetched flagged URL → resolve reverts, status stays `SUBMITTED`.
 8. Double-resolve blocked.
-9. Forced `emit_transfer` failure on OVERTURNED → bonus rolled back, `PAYOUT_FAILED` → `retry_resolution` pays the locked `final_payout_amount`.
+9. Forced `emit_transfer` failure on OVERTURNED → bonus rolled back, `PAYOUT_FAILED` → `retry_resolution` re-debits bonus and pays; post-retry `pool_balance` matches available funds (including when the pool was drained before retry).
 10. Wei round-trip at `10^18`.
 
 Frontend money helpers:
@@ -145,10 +145,10 @@ Opens `http://localhost:3000`.
 Environment:
 
 ```env
-VITE_CONTRACT_ADDRESS=0x8116D8Eaeb6062F060B8fAbC0fa8249A61e9DdbC
+VITE_CONTRACT_ADDRESS=0xa7811026685d8d1Bb1d65f77965B9A465668B4aA
 ```
 
-Current Studionet deployment: `0x8116D8Eaeb6062F060B8fAbC0fa8249A61e9DdbC`. Owner must call `set_config` before the first appeal can be filed.
+Current Studionet deployment: `0xa7811026685d8d1Bb1d65f77965B9A465668B4aA`. Owner must call `set_config` before the first appeal can be filed.
 
 ---
 
@@ -160,12 +160,13 @@ See [`scripts/deploy/studionet.md`](scripts/deploy/studionet.md). Summary:
 2. Deploy. Confirm **`Result: SUCCESS`**.
 3. Set `VITE_CONTRACT_ADDRESS`, call `set_config` from the owner wallet, then ship the frontend.
 
-**Contract address:** [`0x8116D8Eaeb6062F060B8fAbC0fa8249A61e9DdbC`](https://genlayer-explorer.vercel.app/address/0x8116D8Eaeb6062F060B8fAbC0fa8249A61e9DdbC)
+**Contract address:** [`0xa7811026685d8d1Bb1d65f77965B9A465668B4aA`](https://explorer-studio.genlayer.com/address/0xa7811026685d8d1Bb1d65f77965B9A465668B4aA)
 
 ---
 
 ## Known limits
 
-- `retry_resolution` pays the locked `final_payout_amount` and does not recompute bonus from the current pool. That is intentional so the original verdict's payout cannot change.
+- `retry_resolution` re-debits the bonus from the current pool (capped if the pool shrank) so a successful retry cannot leave recorded `pool_balance` above available funds.
 - Fetch failures inside `resolve_appeal` raise `UserError` (the transaction reverts). Broken JSON does not revert; it marks the appeal `DISPUTED`.
+- Policy references must be authoritative hosts for the selected platform. Duplicate URLs and claimant-controlled hosts are rejected.
 - Network is Studionet only. Do not point the client at testnet.
