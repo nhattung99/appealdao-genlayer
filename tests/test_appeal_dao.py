@@ -73,6 +73,44 @@ def _credit(vm, contract, amount):
         vm._balances[contract.address] = vm._balances.get(contract.address, 0) + amount
 
 
+class _TransferSim:
+    """Simulate emit_transfer failures by wrapping appeal_dao._pay (no gltest private APIs)."""
+
+    def __init__(self, fail_times=0):
+        self.fail_times = int(fail_times)
+        self.payments = []
+
+
+def _appeal_dao_module():
+    import sys
+
+    for mod in list(sys.modules.values()):
+        if mod is None:
+            continue
+        file_path = getattr(mod, "__file__", "") or ""
+        if "appeal_dao" in file_path.replace("\\", "/") and hasattr(mod, "_pay"):
+            return mod
+    for mod in list(sys.modules.values()):
+        if mod is not None and hasattr(mod, "_pay") and hasattr(mod, "Contract"):
+            return mod
+    raise RuntimeError("appeal_dao module not loaded; deploy the contract in this test first")
+
+
+def _install_pay_sim(monkeypatch, sim: _TransferSim):
+    mod = _appeal_dao_module()
+    original = mod._pay
+
+    def wrapped(recipient, amount):
+        if sim.fail_times > 0:
+            sim.fail_times -= 1
+            raise Exception("Simulated native transfer execution failure")
+        sim.payments.append(int(amount))
+        return original(recipient, amount)
+
+    monkeypatch.setattr(mod, "_pay", wrapped)
+    return original
+
+
 def sim_installMocks(vm, web=None, llm=None):
     """Install nondet mocks before every AI tx. Prefer sim_installMocks if present."""
     web = web or {}
@@ -387,22 +425,14 @@ def test_retry_success_cannot_leave_pool_above_available_funds(
     appeal_id = _file(contract, vm, creator)
     locked_payout = DEPOSIT + BONUS
 
-    import gltest.direct.loader
-    original_emit = gltest.direct.loader._EOAProxy.emit_transfer
-
-    def failing_emit_transfer(self, value=None, **kwargs):
-        raise Exception("Simulated native transfer execution failure")
-
-    monkeypatch.setattr(gltest.direct.loader._EOAProxy, "emit_transfer", failing_emit_transfer)
+    pay_sim = _TransferSim(fail_times=1)
+    _install_pay_sim(monkeypatch, pay_sim)
     _as(vm, creator)
     _resolve(contract, vm, appeal_id, "OVERTURNED", 97, "Ban was incorrect")
     assert _appeal(contract, appeal_id)["status"] == "PAYOUT_FAILED"
     assert _pool(contract) == POOL_FULL  # bonus rolled back on failure
 
-    # Drain some of the pool before retry via a successful overturned appeal.
-    monkeypatch.undo()
-
-    # Consume BONUS from pool via a successful overturned appeal.
+    # Consume BONUS from pool via a successful overturned appeal (transfers succeed again).
     second_id = _file(contract, vm, creator, desc="Second appeal consumes pool bonus")
     _as(vm, creator)
     _resolve(contract, vm, second_id, "OVERTURNED", 90, "Second win")
@@ -410,13 +440,6 @@ def test_retry_success_cannot_leave_pool_above_available_funds(
     pool_before_retry = _pool(contract)
     assert pool_before_retry == POOL_FULL - BONUS  # 450
 
-    payments = []
-
-    def recording_emit(self, value=None, **kwargs):
-        payments.append(int(value or 0))
-        return original_emit(self, value, **kwargs)
-
-    monkeypatch.setattr(gltest.direct.loader._EOAProxy, "emit_transfer", recording_emit)
     _as(vm, creator)
     contract.retry_resolution(appeal_id)
 
@@ -425,7 +448,7 @@ def test_retry_success_cannot_leave_pool_above_available_funds(
     assert row["settled"] is True
     # Full locked bonus still available (450 >= 50), so payout stays locked amount.
     assert int(row["final_payout_amount"]) == locked_payout
-    assert payments == [locked_payout]
+    assert pay_sim.payments[-1] == locked_payout
     assert _pool(contract) == pool_before_retry - BONUS
     # Invariant: recorded pool never exceeds what a steward would treat as available after payout.
     assert _pool(contract) >= 0
@@ -440,13 +463,8 @@ def test_retry_caps_bonus_when_pool_is_short(
     _setup(contract, vm, owner, deposit=DEPOSIT, bonus=BONUS, pool=15)
 
     appeal_id = _file(contract, vm, creator)
-    import gltest.direct.loader
-    original_emit = gltest.direct.loader._EOAProxy.emit_transfer
-
-    def failing_emit_transfer(self, value=None, **kwargs):
-        raise Exception("Simulated native transfer execution failure")
-
-    monkeypatch.setattr(gltest.direct.loader._EOAProxy, "emit_transfer", failing_emit_transfer)
+    pay_sim = _TransferSim(fail_times=1)
+    _install_pay_sim(monkeypatch, pay_sim)
     _as(vm, creator)
     _resolve(contract, vm, appeal_id, "OVERTURNED", 95, "Should lock capped bonus")
     row = _appeal(contract, appeal_id)
@@ -454,22 +472,12 @@ def test_retry_caps_bonus_when_pool_is_short(
     assert int(row["final_payout_amount"]) == DEPOSIT + 15
     assert _pool(contract) == 15
 
-    monkeypatch.undo()
-
     # Drain pool below locked bonus via a successful overturned with remaining 15.
-    # File another appeal; pool has 15, bonus config 50 → caps to 15, pool→0.
     other_id = _file(contract, vm, creator, desc="Consumes remaining pool")
     _as(vm, creator)
     _resolve(contract, vm, other_id, "OVERTURNED", 90, "Takes remaining pool")
     assert _pool(contract) == 0
 
-    payments = []
-
-    def recording_emit(self, value=None, **kwargs):
-        payments.append(int(value or 0))
-        return original_emit(self, value, **kwargs)
-
-    monkeypatch.setattr(gltest.direct.loader._EOAProxy, "emit_transfer", recording_emit)
     _as(vm, creator)
     contract.retry_resolution(appeal_id)
 
@@ -478,7 +486,7 @@ def test_retry_caps_bonus_when_pool_is_short(
     assert row["settled"] is True
     # Bonus capped to 0 available → payout is deposit only; pool stays 0 (not inflated).
     assert int(row["final_payout_amount"]) == DEPOSIT
-    assert payments == [DEPOSIT]
+    assert pay_sim.payments[-1] == DEPOSIT
     assert _pool(contract) == 0
 
 
@@ -627,13 +635,8 @@ def test_transfer_fail_rolls_back_bonus_then_retry_uses_locked_payout(
     appeal_id = _file(contract, vm, creator)
     locked_payout = DEPOSIT + BONUS
 
-    import gltest.direct.loader
-    original_emit = gltest.direct.loader._EOAProxy.emit_transfer
-
-    def failing_emit_transfer(self, value=None, **kwargs):
-        raise Exception("Simulated native transfer execution failure")
-
-    monkeypatch.setattr(gltest.direct.loader._EOAProxy, "emit_transfer", failing_emit_transfer)
+    pay_sim = _TransferSim(fail_times=1)
+    _install_pay_sim(monkeypatch, pay_sim)
 
     _as(vm, creator)
     _resolve(contract, vm, appeal_id, "OVERTURNED", 97, "Ban was incorrect")
@@ -649,15 +652,6 @@ def test_transfer_fail_rolls_back_bonus_then_retry_uses_locked_payout(
     with pytest.raises(Exception):
         contract.retry_resolution(appeal_id)
 
-    monkeypatch.undo()
-    payments = []
-
-    def recording_emit(self, value=None, **kwargs):
-        payments.append(int(value or 0))
-        return original_emit(self, value, **kwargs)
-
-    monkeypatch.setattr(gltest.direct.loader._EOAProxy, "emit_transfer", recording_emit)
-
     _as(vm, creator)
     contract.retry_resolution(appeal_id)
 
@@ -665,7 +659,7 @@ def test_transfer_fail_rolls_back_bonus_then_retry_uses_locked_payout(
     assert row["status"] == "RESOLVED_OVERTURNED"
     assert row["settled"] is True
     assert int(row["final_payout_amount"]) == locked_payout
-    assert payments == [locked_payout]
+    assert pay_sim.payments == [locked_payout]
     # Successful retry must re-debit the bonus so recorded pool matches available funds.
     assert _pool(contract) == POOL_FULL - BONUS
 
